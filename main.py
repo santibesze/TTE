@@ -3,7 +3,7 @@
 # ============================================================
 #
 # Flujo:
-#   1. Lee entrada_00.json
+#   1. Lee entrada_01.json
 #   2. Inyecta los datos en una COPIA de la plantilla
 #      "Estrella gradual - Fina R1.xlsx" (Hoja1)
 #   3. Recalcula las fórmulas (motor interno, sin LibreOffice)
@@ -19,6 +19,7 @@ import json
 import math
 import re
 import shutil
+import sys
 import unicodedata
 import warnings
 from pathlib import Path
@@ -34,7 +35,7 @@ warnings.filterwarnings("ignore", module="openpyxl")
 # ARCHIVOS
 # ============================================================
 
-ARCHIVO_JSON = "entrada_00.json"
+ARCHIVO_JSON = "entrada_02.json"
 ARCHIVO_CBC = "CBC (1).xlsx"
 ARCHIVO_ESTRELLA = "Estrella gradual - Fina R1.xlsx"
 # La plantilla original NO se modifica: se trabaja sobre una copia.
@@ -56,12 +57,37 @@ MAPA_JSON_CELDAS = {
     "bil_prim_neutro": "E13",
 }
 
-# Opcionales: si el JSON los trae, se escriben; si no, se conserva
-# el valor que tenga la plantilla (E14 / E15).
-MAPA_JSON_OPCIONAL = {
-    "uwh_prim_fase": "E14",
-    "uwh_prim_neutro": "E15",
+# Tensiones aplicadas (frecuencia industrial). Son OBLIGATORIAS en el JSON.
+#
+# CELDA_UWH1: la plantilla toma UWH1 de Hoja1!E14 ("Frecuencia Industrial
+# (UWH1)") y Hoja2!F3 = Hoja1!E14 alimenta todas las fórmulas. L19 está
+# vacía y nada depende de ella, por eso se usa E14. Si realmente querés
+# otra celda, cambiá solo esta constante.
+CELDA_UWH1 = "E14"
+CELDA_UWH0 = "E15"
+
+# nombre canónico -> (celda, claves aceptadas en el JSON)
+MAPA_JSON_APLICADA = {
+    "uwh_prim_fase": (CELDA_UWH1, ["ensayo_apli_prim_fase"]),
+    "uwh_prim_neutro": (CELDA_UWH0, ["ensayo_apli_prim_neutro"]),
 }
+
+
+class ConexionNoSoportada(Exception):
+    """La conexión pedida todavía no se puede calcular (Delta)."""
+
+
+def validar_conexion_soportada(datos):
+    """Por ahora solo se calcula conexión Estrella."""
+    if normalizar_conexion(datos.get("prim_grupo")) == "D":
+        raise ConexionNoSoportada("No puedo calcular para conexión Delta")
+
+
+def buscar_clave_json(datos, alias):
+    for k in alias:
+        if k in datos:
+            return k
+    return None
 
 
 # ============================================================
@@ -142,11 +168,11 @@ def conexion_a_texto_excel(grupo):
 # JSON
 # ============================================================
 
-def cargar_json():
-    ruta = Path(ARCHIVO_JSON)
+def cargar_json(ruta_json=None):
+    ruta = Path(ruta_json or ARCHIVO_JSON)
 
     if not ruta.exists():
-        raise FileNotFoundError(f"No se encontró el archivo JSON: {ARCHIVO_JSON}")
+        raise FileNotFoundError(f"No se encontró el archivo JSON: {ruta}")
 
     try:
         with open(ruta, "r", encoding="utf-8") as archivo:
@@ -174,6 +200,11 @@ def mostrar_datos_json(datos):
     for nombre, clave in campos:
         print(f"{nombre}: {datos.get(clave, 'NO ENCONTRADO')}")
 
+    for nombre, canon in (("Tensión aplicada fase UWH1 [kV]", "uwh_prim_fase"),
+                          ("Tensión aplicada neutro UWH0 [kV]", "uwh_prim_neutro")):
+        clave = buscar_clave_json(datos, MAPA_JSON_APLICADA[canon][1])
+        print(f"{nombre}: {datos[clave] if clave else 'NO ENCONTRADO'}")
+
 
 # ============================================================
 # 1) INYECCIÓN DEL JSON EN LA PLANTILLA
@@ -189,8 +220,10 @@ def inyectar_json_en_estrella(datos_json, ruta_excel):
         cbc_paso_porc   -> E10       bil_prim_fase   -> E12
         bil_prim_neutro -> E13
 
+        ensayo_apli_prim_fase   -> E14 (UWH1)
+        ensayo_apli_prim_neutro -> E15 (UWH0)
+
     Solo se tocan celdas de ENTRADA; las fórmulas quedan intactas.
-    Opcionalmente 'uwh_prim_fase' -> E14 y 'uwh_prim_neutro' -> E15.
 
     Guarda en la misma ruta indicada (pasar una copia de la plantilla).
     Nota: openpyxl guarda las fórmulas sin valores en caché; por eso
@@ -224,12 +257,15 @@ def inyectar_json_en_estrella(datos_json, ruta_excel):
 
         ws[celda].value = valor
 
-    for clave, celda in MAPA_JSON_OPCIONAL.items():
-        if clave in datos_json:
-            numero = convertir_numero(datos_json[clave])
-            if numero is None:
-                raise ValueError(f"Valor inválido para '{clave}'.")
-            ws[celda].value = int(numero) if numero.is_integer() else numero
+    for canon, (celda, alias) in MAPA_JSON_APLICADA.items():
+        clave = buscar_clave_json(datos_json, alias)
+        numero = convertir_numero(datos_json[clave]) if clave else None
+        if numero is None:
+            raise ValueError(
+                f"Falta (o es inválida) la tensión aplicada en el JSON "
+                f"para {celda}. Claves aceptadas: {', '.join(alias)}"
+            )
+        ws[celda].value = int(numero) if numero.is_integer() else numero
 
     wb.save(ruta)
     return ruta
@@ -238,6 +274,13 @@ def inyectar_json_en_estrella(datos_json, ruta_excel):
 # ============================================================
 # 2) RECÁLCULO (motor interno, sin LibreOffice)
 # ============================================================
+#
+# Evalúa las fórmulas del libro leyéndolas con openpyxl y
+# traduciéndolas a Python. Soporta lo que usa la plantilla:
+# + - * / ^, paréntesis, SQRT, MIN, MAX, SUM, ABS, ROUND, IF,
+# referencias 'Hoja'!A1 y rangos. Si una fórmula usa algo no
+# soportado o da error (#REF!, /0), esa celda queda como error
+# y solo falla si el programa la necesita.
 
 class ErrorCelda(Exception):
     pass
@@ -408,6 +451,7 @@ def recalcular_estrella(ruta_excel, celdas_hoja1):
 CELDAS_RESULTADO = [
     "I11", "I12", "I13",          # I_max, V_step, P_step
     "H28", "H29",                 # A  (50 Hz / impulso)
+    "K28", "K29",                 # A1 (50 Hz / impulso)
     "J24", "J25",                 # B  (50 Hz / impulso)
     "B28", "C28", "B29", "C29",   # F  (fila 28: 50 Hz / fila 29: impulso)
 ]
@@ -432,6 +476,8 @@ def leer_estrella(datos_json, ruta_original=ARCHIVO_ESTRELLA,
 
     Devuelve el dict de parámetros usado por seleccionar_cbc().
     """
+    validar_conexion_soportada(datos_json)
+
     origen = Path(ruta_original)
     if not origen.exists():
         raise FileNotFoundError(f"No se encontró el archivo '{ruta_original}'.")
@@ -442,6 +488,7 @@ def leer_estrella(datos_json, ruta_original=ARCHIVO_ESTRELLA,
     r = recalcular_estrella(ruta_copia, CELDAS_RESULTADO)
 
     a_50, a_imp = _exigir(r, "H28"), _exigir(r, "H29")
+    a1_50, a1_imp = _exigir(r, "K28"), _exigir(r, "K29")
     b_50, b_imp = _exigir(r, "J24"), _exigir(r, "J25")
     f28 = [_exigir(r, "B28"), _exigir(r, "C28")]
     f29 = [_exigir(r, "B29"), _exigir(r, "C29")]
@@ -453,18 +500,18 @@ def leer_estrella(datos_json, ruta_original=ARCHIVO_ESTRELLA,
 
         # A / B / F separados por tipo de ensayo
         "a_50hz": a_50, "a_imp": a_imp,       # H28 / H29
+        "a1_50hz": a1_50, "a1_imp": a1_imp,   # K28 / K29
         "b_50hz": b_50, "b_imp": b_imp,       # J24 / J25
         "f_max_28": max(f28),                 # fila 28 -> 50 Hz
         "f_max_29": max(f29),                 # fila 29 -> impulso
 
-        # compatibilidad con el nombre de variables anterior
-        "a": a_imp, "a1": a_50,
-        "b": b_imp, "b1": b_50,
+        # valores individuales de F (para mostrar)
         "f1": f28[0], "f2": f28[1], "f3": f29[0], "f4": f29[1],
 
         "fuente": ruta_copia,
         "fila_resultados_excel": 29,
     }
+
 
 # ============================================================
 # 4) CATÁLOGO CBC
@@ -550,7 +597,8 @@ def mapear_columnas(tabla):
         if clave:
             ensayo[clave] = real
 
-    for req in [("a", "imp"), ("a", "50hz"), ("b", "imp"), ("f", "imp")]:
+    for req in [("a", "imp"), ("a", "50hz"), ("a1", "imp"), ("a1", "50hz"),
+                ("b", "imp"), ("f", "imp")]:
         if req not in ensayo:
             faltantes.append(f"{req[0]} ({req[1]})")
 
@@ -596,6 +644,7 @@ def seleccionar_cbc(tabla, datos, parametros, columnas=None):
     P_step (I13)                -> Capacidad de contactos [kVA]
     V_step (I12)                -> Máx. tensión por escalón 1 y 2 [V]
     A: H28 (50 Hz) / H29 (imp.) -> a  50Hz 1min / a  1,2/50us
+    A1: K28 (50 Hz) / K29 (imp.)-> a1 50Hz 1min / a1 1,2/50us
     B: J24 (50 Hz) / J25 (imp.) -> b  (Y)  o  b1,b2,b3 (D)
     F: máx. fila 28 (50 Hz)     -> f, f_1, f_2  50Hz 1min
        máx. fila 29 (impulso)   -> f, f_1, f_2  1,2/50us
@@ -614,7 +663,8 @@ def seleccionar_cbc(tabla, datos, parametros, columnas=None):
 
     # familia -> (requerido 50 Hz, requerido impulso)
     familias_b = ["b"] if conexion == "Y" else ["b1", "b2", "b3"]
-    requisitos = [("a", parametros["a_50hz"], parametros["a_imp"])]
+    requisitos = [("a", parametros["a_50hz"], parametros["a_imp"]),
+                  ("a1", parametros["a1_50hz"], parametros["a1_imp"])]
     requisitos += [(f, parametros["b_50hz"], parametros["b_imp"]) for f in familias_b]
     requisitos += [(f, parametros["f_max_28"], parametros["f_max_29"])
                    for f in ("f", "f_1", "f_2")]
@@ -677,7 +727,8 @@ def diagnosticar_rechazos(tabla, datos, parametros, columnas):
               ("P_step", bas["capacidad"], parametros["P_step"]),
               ("V_step esc.1", bas["vstep1"], parametros["V_step"]),
               ("V_step esc.2", bas["vstep2"], parametros["V_step"])]
-    for fam, r50, rimp in ([("a", parametros["a_50hz"], parametros["a_imp"])]
+    for fam, r50, rimp in ([("a", parametros["a_50hz"], parametros["a_imp"]),
+                            ("a1", parametros["a1_50hz"], parametros["a1_imp"])]
                            + [(f, parametros["b_50hz"], parametros["b_imp"]) for f in familias_b]
                            + [(f, parametros["f_max_28"], parametros["f_max_29"])
                               for f in ("f", "f_1", "f_2")]):
@@ -734,11 +785,14 @@ def generar_pma(seleccionado, conexion, tension, columnas):
 # MAIN
 # ============================================================
 
-def main():
+def main(ruta_json=None):
     try:
-        # 1. JSON
-        datos = cargar_json()
+        # 1. JSON  (uso: python main_cbc.py entrada_00.json)
+        datos = cargar_json(ruta_json)
         mostrar_datos_json(datos)
+
+        # Por ahora solo se calcula conexión Estrella
+        validar_conexion_soportada(datos)
 
         # 2. Inyección + recálculo + lectura de resultados
         print("\nINYECTANDO JSON Y RECALCULANDO ESTRELLA GRADUAL FINA")
@@ -751,6 +805,8 @@ def main():
         print(f"P_step (I13)         : {fmt(parametros['P_step'])}")
         print(f"A  H28 (50 Hz)       : {fmt(parametros['a_50hz'])}")
         print(f"A  H29 (impulso)     : {fmt(parametros['a_imp'])}")
+        print(f"A1 K28 (50 Hz)       : {fmt(parametros['a1_50hz'])}")
+        print(f"A1 K29 (impulso)     : {fmt(parametros['a1_imp'])}")
         print(f"B  J24 (50 Hz)       : {fmt(parametros['b_50hz'])}")
         print(f"B  J25 (impulso)     : {fmt(parametros['b_imp'])}")
         print(f"F  B28={fmt(parametros['f1'])}  C28={fmt(parametros['f2'])}"
@@ -792,6 +848,9 @@ def main():
         generar_pma(seleccionado, conexion, datos["tension_prim"], columnas)
         print("\nArchivo PMA.xlsx generado correctamente.")
 
+    except ConexionNoSoportada as e:
+        print(f"\n{e}")
+
     except Exception as e:
         print("\nERROR:")
         print(str(e))
@@ -802,4 +861,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else None)
     main()
