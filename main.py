@@ -35,7 +35,7 @@ warnings.filterwarnings("ignore", module="openpyxl")
 # ARCHIVOS
 # ============================================================
 
-ARCHIVO_JSON = "entrada_02.json"
+ARCHIVO_JSON = "entrada_04.json"
 ARCHIVO_CBC = "CBC (1).xlsx"
 ARCHIVO_ESTRELLA = "Estrella gradual - Fina R1.xlsx"
 # La plantilla original NO se modifica: se trabaja sobre una copia.
