@@ -35,8 +35,8 @@ warnings.filterwarnings("ignore", module="openpyxl")
 # ARCHIVOS
 # ============================================================
 
-ARCHIVO_JSON = "entrada_04.json"
-ARCHIVO_CBC = "CBC (1).xlsx"
+ARCHIVO_JSON = "entrada_15.json"
+ARCHIVO_CBC = "Tabla_CBC (1).xlsx"
 ARCHIVO_ESTRELLA = "Estrella gradual - Fina R1.xlsx"
 # La plantilla original NO se modifica: se trabaja sobre una copia.
 ARCHIVO_ESTRELLA_CALC = "Estrella gradual - Fina R1 (calculado).xlsx"
@@ -862,4 +862,3 @@ def main(ruta_json=None):
 
 if __name__ == "__main__":
     main(sys.argv[1] if len(sys.argv) > 1 else None)
-    main()
