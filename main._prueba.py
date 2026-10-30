@@ -3,12 +3,16 @@
 # ============================================================
 #
 # Flujo:
-#   1. Lee entrada_01.json
+#   1. Lee el JSON de entrada (por argumento, o ARCHIVO_JSON por defecto)
 #   2. Inyecta los datos en una COPIA de la plantilla
 #      "Estrella gradual - Fina R1.xlsx" (Hoja1)
 #   3. Recalcula las fórmulas (motor interno, sin LibreOffice)
 #   4. Lee I_max, V_step, P_step, A, B, F calculados
-#   5. Compara contra el catálogo "CBC (1).xlsx"
+#   5. Compara contra el catálogo "Tabla_CBC 1.xlsx".
+#      Si ningún CBC (que no sea RMV) de la conexión pedida soporta la
+#      corriente I_max, se busca entre los RMV-II del mismo catálogo
+#      (corrientes muy altas). Los RMV se evalúan con los mismos criterios
+#      que el resto; las celdas '---' / vacías significan "no aplica".
 #   6. Genera PMA.xlsx con el modelo seleccionado
 #
 # Dependencias: pandas, openpyxl  (nada más)
@@ -35,8 +39,8 @@ warnings.filterwarnings("ignore", module="openpyxl")
 # ARCHIVOS
 # ============================================================
 
-ARCHIVO_JSON = "entrada_12.json"
-ARCHIVO_CBC = "Tabla_CBC (1).xlsx"
+ARCHIVO_JSON = "entrada_17.json"
+ARCHIVO_CBC = "Tabla_CBC 1.xlsx"
 ARCHIVO_ESTRELLA = "Estrella gradual - Fina R1.xlsx"
 # La plantilla original NO se modifica: se trabaja sobre una copia.
 ARCHIVO_ESTRELLA_CALC = "Estrella gradual - Fina R1 (calculado).xlsx"
@@ -123,6 +127,12 @@ def fmt(valor):
     if valor is None:
         return "-"
     return f"{valor:.3f}"
+
+
+def fmt_g(valor):
+    """Formato corto (600.0 -> '600'); si no es número devuelve el texto."""
+    n = convertir_numero(valor)
+    return f"{n:g}" if n is not None else str(valor)
 
 
 def _sin_acentos(texto):
@@ -476,8 +486,6 @@ def leer_estrella(datos_json, ruta_original=ARCHIVO_ESTRELLA,
 
     Devuelve el dict de parámetros usado por seleccionar_cbc().
     """
-    validar_conexion_soportada(datos_json)
-
     origen = Path(ruta_original)
     if not origen.exists():
         raise FileNotFoundError(f"No se encontró el archivo '{ruta_original}'.")
@@ -533,6 +541,11 @@ ALIAS_COLUMNAS = {
                    "maximo n de posiciones de operacion"],
 }
 
+# Columnas que se usan si existen (no son imprescindibles)
+ALIAS_OPCIONALES = {
+    "tension_equipo": ["maxima tension de equipamiento"],
+}
+
 # familias de columnas eléctricas: prefijo + tipo de ensayo
 FAMILIAS_ENSAYO = ["a", "a1", "b", "b1", "b2", "b3",
                    "c1", "c2", "c2_1", "c2_2", "f", "f_1", "f_2"]
@@ -569,7 +582,11 @@ def cargar_catalogo():
         for c in tabla.columns
     ]
 
-    # Se descartan filas sin datos y las notas al pie (sin corriente / conexión)
+    # Fila real del Excel (header en la fila 2 => primer dato = fila 3).
+    # Se guarda ANTES de filtrar para que siga siendo correcta.
+    tabla["_fila_excel_cbc"] = tabla.index + 3
+
+    # Se descartan filas sin datos y las notas al pie (sin ITEM o sin fases)
     tabla = tabla[tabla.iloc[:, 0].notna() & tabla.iloc[:, 4].notna()]
     return tabla.reset_index(drop=True)
 
@@ -589,6 +606,11 @@ def mapear_columnas(tabla):
         if real is None:
             faltantes.append(logico)
         else:
+            basicas[logico] = real
+
+    for logico, alias in ALIAS_OPCIONALES.items():
+        real = next((por_norm[a] for a in alias if a in por_norm), None)
+        if real is not None:
             basicas[logico] = real
 
     ensayo = {}
@@ -625,6 +647,52 @@ def normalizar_conexion_catalogo(valor):
 
 
 # ============================================================
+# RMV  (corrientes muy altas)
+# ============================================================
+#
+# Los RMV-II están en el mismo catálogo que el resto, con la conexión
+# vacía (sirven para Y y D). Solo tienen datos en a1 (y en tensión por
+# escalón 1, capacidad, posiciones); lo demás es '---' y se ignora.
+#
+# Se usan SOLO cuando ningún CBC no-RMV de la conexión pedida soporta
+# I_max. Entre los RMV se aplican los mismos criterios que al resto
+# (I_max, P_step, V_step, posiciones, A1...): la clase de tensión se
+# define sola, porque la de 15 / 26,4 kV tiene 1000 V por escalón y a1
+# más bajo que la de 72,5 kV.
+#
+# Opcional: clave del JSON con una tensión [kV] que la "Máxima tensión
+# de equipamiento" del RMV debe cubrir (p. ej. "tension_prim"). Con None
+# (por defecto) no se exige nada más que lo anterior.
+RMV_TENSION_CLAVE = None
+
+
+def es_modelo_rmv(modelo):
+    """True si el modelo del catálogo es un RMV (RMV-II, RMV II, ...)."""
+    return normalizar_texto(modelo).replace(" ", "").startswith("rmv")
+
+
+def umbral_corriente_alta(tabla, columnas, conexion):
+    """
+    Mayor corriente nominal entre los CBC NO-RMV de la conexión pedida
+    ('Y' o 'D'). Si I_max la supera, ninguno sirve y se pasa a los RMV.
+    """
+    bas = columnas["basicas"]
+    corrientes = [
+        convertir_numero(f[bas["corriente"]])
+        for _, f in tabla.iterrows()
+        if not es_modelo_rmv(f[bas["modelo"]])
+        and normalizar_conexion_catalogo(f[bas["conexion"]]) == conexion
+    ]
+    corrientes = [c for c in corrientes if c is not None]
+    if not corrientes:
+        raise ValueError(
+            f"No hay CBC de conexión {conexion} en el catálogo para fijar "
+            f"el umbral de corriente alta."
+        )
+    return max(corrientes)
+
+
+# ============================================================
 # 5) SELECCIÓN
 # ============================================================
 
@@ -634,9 +702,24 @@ def _cumple(fila, columna, requerido):
     return True if v is None else v >= requerido
 
 
-def seleccionar_cbc(tabla, datos, parametros, columnas=None):
+def _tension_minima_equipo(datos, bas):
+    """Tensión mínima del equipo exigida a los RMV (None = no se exige)."""
+    if not RMV_TENSION_CLAVE:
+        return None
+    if "tension_equipo" not in bas:
+        raise ValueError("El catálogo no tiene la columna 'Máxima tensión de equipamiento'.")
+    tension = convertir_numero(datos.get(RMV_TENSION_CLAVE))
+    if tension is None:
+        raise ValueError(f"Falta (o es inválida) la tensión '{RMV_TENSION_CLAVE}' en el JSON.")
+    return tension
+
+
+def seleccionar_cbc(tabla, datos, parametros, columnas=None, rmv=False):
     """
     Compara los valores calculados en Estrella gradual contra el catálogo.
+
+    rmv=False -> modelos que no son RMV, de la conexión pedida.
+    rmv=True  -> solo RMV (conexión indistinta); mismos criterios.
 
     Requeridos (Estrella)          Catálogo
     ---------------------          --------------------------------
@@ -648,6 +731,8 @@ def seleccionar_cbc(tabla, datos, parametros, columnas=None):
     B: J24 (50 Hz) / J25 (imp.) -> b  (Y)  o  b1,b2,b3 (D)
     F: máx. fila 28 (50 Hz)     -> f, f_1, f_2  50Hz 1min
        máx. fila 29 (impulso)   -> f, f_1, f_2  1,2/50us
+
+    Celdas vacías / '---' = no aplica (cumplen).
     """
     if columnas is None:
         columnas = mapear_columnas(tabla)
@@ -661,6 +746,8 @@ def seleccionar_cbc(tabla, datos, parametros, columnas=None):
         + 1
     )
 
+    tension_min_equipo = _tension_minima_equipo(datos, bas) if rmv else None
+
     # familia -> (requerido 50 Hz, requerido impulso)
     familias_b = ["b"] if conexion == "Y" else ["b1", "b2", "b3"]
     requisitos = [("a", parametros["a_50hz"], parametros["a_imp"]),
@@ -671,17 +758,20 @@ def seleccionar_cbc(tabla, datos, parametros, columnas=None):
 
     candidatos = []
 
-    for indice, fila in tabla.iterrows():
+    for _, fila in tabla.iterrows():
 
-        if normalizar_conexion_catalogo(fila[bas["conexion"]]) != conexion:
+        # RMV y no-RMV se evalúan por separado
+        if es_modelo_rmv(fila[bas["modelo"]]) != rmv:
+            continue
+
+        if not rmv and normalizar_conexion_catalogo(fila[bas["conexion"]]) != conexion:
             continue
 
         corriente = convertir_numero(fila[bas["corriente"]])
         if corriente is None or corriente < parametros["I_max"]:
             continue
 
-        potencia = convertir_numero(fila[bas["capacidad"]])
-        if potencia is None or potencia < parametros["P_step"]:
+        if not _cumple(fila, bas["capacidad"], parametros["P_step"]):
             continue
 
         max_pos = convertir_numero(fila[bas["posiciones"]])
@@ -691,6 +781,10 @@ def seleccionar_cbc(tabla, datos, parametros, columnas=None):
         if not _cumple(fila, bas["vstep1"], parametros["V_step"]):
             continue
         if not _cumple(fila, bas["vstep2"], parametros["V_step"]):
+            continue
+
+        if tension_min_equipo is not None and \
+                not _cumple(fila, bas["tension_equipo"], tension_min_equipo):
             continue
 
         ok = True
@@ -705,28 +799,45 @@ def seleccionar_cbc(tabla, datos, parametros, columnas=None):
         if not ok:
             continue
 
-        candidato = fila.copy()
-        # header en fila 2 del Excel + índice 0-based => fila = índice + 3
-        candidato["_fila_excel_cbc"] = indice + 3
-        candidatos.append(candidato)
+        # '_fila_excel_cbc' ya viene en la fila (lo agrega cargar_catalogo)
+        candidatos.append(fila.copy())
 
-    candidatos.sort(key=lambda f: (
-        convertir_numero(f[bas["corriente"]]),
-        convertir_numero(f[bas["capacidad"]]) or 0,
-    ))
+    def clave_orden(f):
+        equipo = 0
+        if rmv and "tension_equipo" in bas:
+            equipo = convertir_numero(f[bas["tension_equipo"]]) or 0
+        return (
+            convertir_numero(f[bas["corriente"]]),
+            equipo,
+            convertir_numero(f[bas["capacidad"]]) or 0,
+        )
+
+    candidatos.sort(key=clave_orden)
     return candidatos
 
 
-def diagnosticar_rechazos(tabla, datos, parametros, columnas):
-    """Explica por qué cada modelo de la conexión pedida fue descartado."""
+def diagnosticar_rechazos(tabla, datos, parametros, columnas, rmv=False):
+    """Explica por qué cada modelo (de la conexión pedida, o los RMV) fue descartado."""
     bas, ens = columnas["basicas"], columnas["ensayo"]
     conexion = normalizar_conexion(datos["prim_grupo"])
     familias_b = ["b"] if conexion == "Y" else ["b1", "b2", "b3"]
 
+    posiciones = (
+        convertir_numero(datos["cbc_pasos_inf"])
+        + convertir_numero(datos["cbc_pasos_sup"])
+        + 1
+    )
+
     checks = [("I_max", bas["corriente"], parametros["I_max"]),
               ("P_step", bas["capacidad"], parametros["P_step"]),
               ("V_step esc.1", bas["vstep1"], parametros["V_step"]),
-              ("V_step esc.2", bas["vstep2"], parametros["V_step"])]
+              ("V_step esc.2", bas["vstep2"], parametros["V_step"]),
+              ("Posiciones", bas["posiciones"], posiciones)]
+
+    tension_min_equipo = _tension_minima_equipo(datos, bas) if rmv else None
+    if tension_min_equipo is not None:
+        checks.append(("Tensión equipo", bas["tension_equipo"], tension_min_equipo))
+
     for fam, r50, rimp in ([("a", parametros["a_50hz"], parametros["a_imp"]),
                             ("a1", parametros["a1_50hz"], parametros["a1_imp"])]
                            + [(f, parametros["b_50hz"], parametros["b_imp"]) for f in familias_b]
@@ -739,14 +850,16 @@ def diagnosticar_rechazos(tabla, datos, parametros, columnas):
 
     lineas = []
     for _, fila in tabla.iterrows():
-        if normalizar_conexion_catalogo(fila[bas["conexion"]]) != conexion:
+        if es_modelo_rmv(fila[bas["modelo"]]) != rmv:
+            continue
+        if not rmv and normalizar_conexion_catalogo(fila[bas["conexion"]]) != conexion:
             continue
         motivos = []
         for nombre, col, req in checks:
             v = convertir_numero(fila[col])
             if v is not None and v < req:
                 motivos.append(f"{nombre}: {v:g} < {req:.2f}")
-        lineas.append(f"  ITEM {fila[bas['item']]:g} ({fila[bas['corriente']]:g} A): "
+        lineas.append(f"  ITEM {fmt_g(fila[bas['item']])} ({fmt_g(fila[bas['corriente']])} A): "
                       + ("; ".join(motivos) if motivos else "sin rechazo por valores"))
     return lineas
 
@@ -765,7 +878,7 @@ def obtener_tipo_equipo_desde_excel(fila, columnas):
     return f"No identificado ({valor})"
 
 
-def generar_pma(seleccionado, conexion, tension, columnas):
+def generar_pma(seleccionado, conexion, tension, columnas, extra=None):
     wb = Workbook()
     ws = wb.active
     ws.title = "ACCESORIOS"
@@ -778,7 +891,80 @@ def generar_pma(seleccionado, conexion, tension, columnas):
     ws["B2"] = conexion
     ws["C2"] = tension
 
+    # columnas adicionales (solo RMV)
+    if extra:
+        for i, (titulo, valor) in enumerate(extra.items()):
+            col = get_column_letter(4 + i)
+            ws[f"{col}1"] = titulo
+            ws[f"{col}2"] = valor
+
     wb.save(ARCHIVO_PMA)
+
+
+def _numero_excel(valor):
+    """float del catálogo -> int si es entero (600.0 -> 600); si no, tal cual."""
+    n = convertir_numero(valor)
+    if n is None:
+        return valor
+    return int(n) if n.is_integer() else n
+
+
+# ============================================================
+# SALIDA POR PANTALLA
+# ============================================================
+
+def imprimir_seleccion(seleccionado, candidatos, columnas):
+    bas = columnas["basicas"]
+
+    conexion_cat = seleccionado[bas["conexion"]]
+    if pd.isna(conexion_cat) or str(conexion_cat).strip() == "":
+        conexion_cat = "Y / D (indistinta)"
+
+    print("\nCBC SELECCIONADO")
+    print("-" * 60)
+    print(f"Modelo: {seleccionado[bas['modelo']]}")
+    print(f"Marca: {seleccionado[bas['marca']]}")
+    print(f"Fases: {seleccionado[bas['fases']]}")
+    print(f"Tipo de equipo: {obtener_tipo_equipo_desde_excel(seleccionado, columnas)}")
+    print(f"Conexión: {conexion_cat}")
+    print(f"Corriente nominal: {seleccionado[bas['corriente']]} A")
+    print(f"Fila del Excel CBC utilizada: {seleccionado['_fila_excel_cbc']}")
+    print(f"Candidatos que cumplen: {len(candidatos)}")
+
+
+def seleccionar_y_reportar_rmv(tabla, datos, parametros, columnas, umbral):
+    """Rama de corriente alta: elige entre los RMV del catálogo."""
+    bas = columnas["basicas"]
+    conexion = normalizar_conexion(datos["prim_grupo"])
+
+    print(f"\nCORRIENTE ALTA: I_max {parametros['I_max']:.1f} A > {umbral:g} A "
+          f"(máx. de los CBC de conexión {conexion})")
+    print("Se evalúan los RMV del catálogo (la conexión no se considera en ellos).")
+    print(f"A1 K28 (50 Hz)       : {fmt(parametros['a1_50hz'])}")
+    print(f"A1 K29 (impulso)     : {fmt(parametros['a1_imp'])}")
+    print(f"Libro calculado: {parametros['fuente']}")
+
+    candidatos = seleccionar_cbc(tabla, datos, parametros, columnas, rmv=True)
+
+    if not candidatos:
+        print("\nNo se ha podido seleccionar un CBC.")
+        print("No hay un RMV disponible para esta configuración.")
+        print("\nMotivos de descarte (RMV):")
+        for linea in diagnosticar_rechazos(tabla, datos, parametros, columnas, rmv=True):
+            print(linea)
+        return
+
+    seleccionado = candidatos[0]
+    imprimir_seleccion(seleccionado, candidatos, columnas)
+
+    extra = {"Corriente nominal [A]": _numero_excel(seleccionado[bas["corriente"]])}
+    if "tension_equipo" in bas:
+        clase = seleccionado[bas["tension_equipo"]]
+        print(f"Clase de tensión: {fmt_g(clase)} kV")
+        extra["Clase de tensión [kV]"] = _numero_excel(clase)
+
+    generar_pma(seleccionado, conexion, datos["tension_prim"], columnas, extra=extra)
+    print("\nArchivo PMA.xlsx generado correctamente.")
 
 
 # ============================================================
@@ -787,14 +973,12 @@ def generar_pma(seleccionado, conexion, tension, columnas):
 
 def main(ruta_json=None):
     try:
-        # 1. JSON  (uso: python main_cbc.py entrada_00.json)
+        # 1. JSON  (uso: python main.py entrada_00.json)
         datos = cargar_json(ruta_json)
         mostrar_datos_json(datos)
 
-        # Por ahora solo se calcula conexión Estrella
-        validar_conexion_soportada(datos)
-
         # 2. Inyección + recálculo + lectura de resultados
+        #    (I_max, V_step y P_step no dependen de la conexión)
         print("\nINYECTANDO JSON Y RECALCULANDO ESTRELLA GRADUAL FINA")
         parametros = leer_estrella(datos)
 
@@ -803,6 +987,21 @@ def main(ruta_json=None):
         print(f"I_max (I11)          : {fmt(parametros['I_max'])}")
         print(f"V_step (I12)         : {fmt(parametros['V_step'])}")
         print(f"P_step (I13)         : {fmt(parametros['P_step'])}")
+
+        # 3. Catálogo + umbral de corriente alta (según la conexión pedida)
+        tabla = cargar_catalogo()
+        columnas = mapear_columnas(tabla)
+        conexion = normalizar_conexion(datos["prim_grupo"])
+        umbral = umbral_corriente_alta(tabla, columnas, conexion)
+
+        # 4. Ningún CBC no-RMV soporta la corriente -> RMV (cualquier conexión)
+        if parametros["I_max"] > umbral:
+            seleccionar_y_reportar_rmv(tabla, datos, parametros, columnas, umbral)
+            return
+
+        # 5. Resto de los CBC: por ahora solo conexión Estrella
+        validar_conexion_soportada(datos)
+
         print(f"A  H28 (50 Hz)       : {fmt(parametros['a_50hz'])}")
         print(f"A  H29 (impulso)     : {fmt(parametros['a_imp'])}")
         print(f"A1 K28 (50 Hz)       : {fmt(parametros['a1_50hz'])}")
@@ -815,11 +1014,6 @@ def main(ruta_json=None):
               f"  -> máx fila 29 (impulso): {fmt(parametros['f_max_29'])}")
         print(f"Libro calculado: {parametros['fuente']}")
 
-        # 3. Catálogo
-        tabla = cargar_catalogo()
-        columnas = mapear_columnas(tabla)
-
-        # 4. Selección
         candidatos = seleccionar_cbc(tabla, datos, parametros, columnas)
 
         if not candidatos:
@@ -831,19 +1025,7 @@ def main(ruta_json=None):
             return
 
         seleccionado = candidatos[0]
-        conexion = normalizar_conexion(datos["prim_grupo"])
-        bas = columnas["basicas"]
-
-        print("\nCBC SELECCIONADO")
-        print("-" * 60)
-        print(f"Modelo: {seleccionado[bas['modelo']]}")
-        print(f"Marca: {seleccionado[bas['marca']]}")
-        print(f"Fases: {seleccionado[bas['fases']]}")
-        print(f"Tipo de equipo: {obtener_tipo_equipo_desde_excel(seleccionado, columnas)}")
-        print(f"Conexión: {seleccionado[bas['conexion']]}")
-        print(f"Corriente nominal: {seleccionado[bas['corriente']]} A")
-        print(f"Fila del Excel CBC utilizada: {seleccionado['_fila_excel_cbc']}")
-        print(f"Candidatos que cumplen: {len(candidatos)}")
+        imprimir_seleccion(seleccionado, candidatos, columnas)
 
         generar_pma(seleccionado, conexion, datos["tension_prim"], columnas)
         print("\nArchivo PMA.xlsx generado correctamente.")

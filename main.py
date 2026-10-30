@@ -8,7 +8,10 @@
 #      "Estrella gradual - Fina R1.xlsx" (Hoja1)
 #   3. Recalcula las fórmulas (motor interno, sin LibreOffice)
 #   4. Lee I_max, V_step, P_step, A, B, F calculados
-#   5. Compara contra el catálogo "CBC (1).xlsx"
+#   5. Si la corriente es ALTA (mayor que la de cualquier otro CBC del
+#      catálogo) se elige un RMV II con su matriz de disponibilidad
+#      (corriente x tensión); la conexión del JSON no importa.
+#      Si no, compara contra el catálogo "CBC (1).xlsx"
 #   6. Genera PMA.xlsx con el modelo seleccionado
 #
 # Dependencias: pandas, openpyxl  (nada más)
@@ -35,8 +38,8 @@ warnings.filterwarnings("ignore", module="openpyxl")
 # ARCHIVOS
 # ============================================================
 
-ARCHIVO_JSON = "entrada_15.json"
-ARCHIVO_CBC = "Tabla_CBC (1).xlsx"
+ARCHIVO_JSON = "entrada_17.json"
+ARCHIVO_CBC = "Tabla_CBC 1.xlsx"
 ARCHIVO_ESTRELLA = "Estrella gradual - Fina R1.xlsx"
 # La plantilla original NO se modifica: se trabaja sobre una copia.
 ARCHIVO_ESTRELLA_CALC = "Estrella gradual - Fina R1 (calculado).xlsx"
@@ -476,8 +479,6 @@ def leer_estrella(datos_json, ruta_original=ARCHIVO_ESTRELLA,
 
     Devuelve el dict de parámetros usado por seleccionar_cbc().
     """
-    validar_conexion_soportada(datos_json)
-
     origen = Path(ruta_original)
     if not origen.exists():
         raise FileNotFoundError(f"No se encontró el archivo '{ruta_original}'.")
@@ -673,6 +674,10 @@ def seleccionar_cbc(tabla, datos, parametros, columnas=None):
 
     for indice, fila in tabla.iterrows():
 
+        # RMV II se elige por su propia matriz (corriente alta)
+        if es_modelo_rmv(fila[bas["modelo"]]):
+            continue
+
         if normalizar_conexion_catalogo(fila[bas["conexion"]]) != conexion:
             continue
 
@@ -739,6 +744,8 @@ def diagnosticar_rechazos(tabla, datos, parametros, columnas):
 
     lineas = []
     for _, fila in tabla.iterrows():
+        if es_modelo_rmv(fila[bas["modelo"]]):
+            continue
         if normalizar_conexion_catalogo(fila[bas["conexion"]]) != conexion:
             continue
         motivos = []
@@ -749,6 +756,87 @@ def diagnosticar_rechazos(tabla, datos, parametros, columnas):
         lineas.append(f"  ITEM {fila[bas['item']]:g} ({fila[bas['corriente']]:g} A): "
                       + ("; ".join(motivos) if motivos else "sin rechazo por valores"))
     return lineas
+
+
+# ============================================================
+# RMV II  (corriente alta)
+# ============================================================
+#
+# Se usa cuando I_max supera la corriente de cualquier otro CBC del
+# catálogo. En ese caso NO se comparan A / B / F: se mira la matriz de
+# disponibilidad corriente x tensión. Sirve para conexión Y y D.
+
+MODELO_RMV2 = "RMV II"
+MARCA_RMV2 = "MR"
+
+# None -> umbral = mayor corriente nominal de los CBC que no son RMV
+# (hoy 600 A). Poné un número (ej. 600) para forzar otro umbral.
+CORRIENTE_ALTA_A = None
+
+# Clave del JSON con la tensión [kV] que se compara con la matriz.
+RMV_TENSION_CLAVE = "tension_prim"
+
+RMV2_TENSIONES_KV = [15, 26.4, 72.5]
+
+# 'X' = existe / '-' = no disponible   (columnas = RMV2_TENSIONES_KV)
+RMV2_MATRIZ = {
+    600:  ["X", "X", "-"],
+    1000: ["X", "X", "-"],
+    1500: ["X", "X", "X"],
+    2000: ["X", "X", "X"],
+    2500: ["-", "-", "X"],
+}
+
+
+def es_modelo_rmv(modelo):
+    """True si el modelo del catálogo es un RMV (para no mezclarlo)."""
+    return normalizar_texto(modelo).replace(" ", "").startswith("rmv")
+
+
+def umbral_corriente_alta(tabla, columnas):
+    """Corriente por encima de la cual se usa RMV II."""
+    if CORRIENTE_ALTA_A is not None:
+        return float(CORRIENTE_ALTA_A)
+
+    bas = columnas["basicas"]
+    corrientes = [
+        convertir_numero(f[bas["corriente"]])
+        for _, f in tabla.iterrows()
+        if not es_modelo_rmv(f[bas["modelo"]])
+    ]
+    corrientes = [c for c in corrientes if c is not None]
+    if not corrientes:
+        raise ValueError("No hay corrientes en el catálogo para fijar el umbral de corriente alta.")
+    return max(corrientes)
+
+
+def seleccionar_rmv2(corriente_a, tension_kv):
+    """
+    Elige la combinación 'X' más chica que soporte la corriente y la
+    tensión: menor corriente nominal >= corriente_a y, dentro de ella,
+    menor clase de tensión >= tension_kv.
+
+    Devuelve (opcion, motivo): opcion = {'corriente': A, 'tension': kV}
+    o None; motivo explica por qué no hay opción.
+    """
+    if corriente_a > max(RMV2_MATRIZ):
+        return None, (f"La corriente {corriente_a:.1f} A supera el máximo del "
+                      f"RMV II ({max(RMV2_MATRIZ)} A).")
+    if tension_kv > max(RMV2_TENSIONES_KV):
+        return None, (f"La tensión {tension_kv:g} kV supera la clase máxima del "
+                      f"RMV II ({max(RMV2_TENSIONES_KV):g} kV).")
+
+    candidatos = [
+        {"corriente": amp, "tension": kv}
+        for amp, fila in RMV2_MATRIZ.items()
+        for kv, marca in zip(RMV2_TENSIONES_KV, fila)
+        if marca == "X" and amp >= corriente_a and kv >= tension_kv
+    ]
+    if not candidatos:
+        return None, "No hay combinación disponible en la matriz del RMV II."
+
+    candidatos.sort(key=lambda c: (c["corriente"], c["tension"]))
+    return candidatos[0], None
 
 
 # ============================================================
@@ -765,7 +853,7 @@ def obtener_tipo_equipo_desde_excel(fila, columnas):
     return f"No identificado ({valor})"
 
 
-def generar_pma(seleccionado, conexion, tension, columnas):
+def generar_pma(seleccionado, conexion, tension, columnas, extra=None):
     wb = Workbook()
     ws = wb.active
     ws.title = "ACCESORIOS"
@@ -778,6 +866,34 @@ def generar_pma(seleccionado, conexion, tension, columnas):
     ws["B2"] = conexion
     ws["C2"] = tension
 
+    # columnas adicionales (solo RMV II)
+    if extra:
+        for i, (titulo, valor) in enumerate(extra.items()):
+            col = get_column_letter(4 + i)
+            ws[f"{col}1"] = titulo
+            ws[f"{col}2"] = valor
+
+    wb.save(ARCHIVO_PMA)
+
+
+def generar_pma_rmv2(opcion, tension):
+    """PMA para RMV II: la conexión es indistinta (Y / D)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "ACCESORIOS"
+
+    ws["A1"] = "Modelo seleccionado"
+    ws["B1"] = "Conexión"
+    ws["C1"] = "Tensión [kV]"
+    ws["D1"] = "Corriente nominal [A]"
+    ws["E1"] = "Clase de tensión [kV]"
+
+    ws["A2"] = MODELO_RMV2
+    ws["B2"] = "Y / D"
+    ws["C2"] = tension
+    ws["D2"] = opcion["corriente"]
+    ws["E2"] = opcion["tension"]
+
     wb.save(ARCHIVO_PMA)
 
 
@@ -787,14 +903,12 @@ def generar_pma(seleccionado, conexion, tension, columnas):
 
 def main(ruta_json=None):
     try:
-        # 1. JSON  (uso: python main_cbc.py entrada_00.json)
+        # 1. JSON  (uso: python main.py entrada_00.json)
         datos = cargar_json(ruta_json)
         mostrar_datos_json(datos)
 
-        # Por ahora solo se calcula conexión Estrella
-        validar_conexion_soportada(datos)
-
         # 2. Inyección + recálculo + lectura de resultados
+        #    (I_max, V_step y P_step no dependen de la conexión)
         print("\nINYECTANDO JSON Y RECALCULANDO ESTRELLA GRADUAL FINA")
         parametros = leer_estrella(datos)
 
@@ -803,6 +917,20 @@ def main(ruta_json=None):
         print(f"I_max (I11)          : {fmt(parametros['I_max'])}")
         print(f"V_step (I12)         : {fmt(parametros['V_step'])}")
         print(f"P_step (I13)         : {fmt(parametros['P_step'])}")
+
+        # 3. Catálogo + umbral de corriente alta
+        tabla = cargar_catalogo()
+        columnas = mapear_columnas(tabla)
+        umbral = umbral_corriente_alta(tabla, columnas)
+
+        # 4. CORRIENTE ALTA -> RMV II (matriz), cualquier conexión
+        if parametros["I_max"] > umbral:
+            seleccionar_y_reportar_rmv2(datos, parametros, umbral)
+            return
+
+        # 5. Resto de los CBC: por ahora solo conexión Estrella
+        validar_conexion_soportada(datos)
+
         print(f"A  H28 (50 Hz)       : {fmt(parametros['a_50hz'])}")
         print(f"A  H29 (impulso)     : {fmt(parametros['a_imp'])}")
         print(f"A1 K28 (50 Hz)       : {fmt(parametros['a1_50hz'])}")
@@ -815,11 +943,6 @@ def main(ruta_json=None):
               f"  -> máx fila 29 (impulso): {fmt(parametros['f_max_29'])}")
         print(f"Libro calculado: {parametros['fuente']}")
 
-        # 3. Catálogo
-        tabla = cargar_catalogo()
-        columnas = mapear_columnas(tabla)
-
-        # 4. Selección
         candidatos = seleccionar_cbc(tabla, datos, parametros, columnas)
 
         if not candidatos:
@@ -856,9 +979,40 @@ def main(ruta_json=None):
         print(str(e))
 
 
+def seleccionar_y_reportar_rmv2(datos, parametros, umbral):
+    """Rama de corriente alta: elige en la matriz del RMV II."""
+    tension = convertir_numero(datos.get(RMV_TENSION_CLAVE))
+    if tension is None:
+        raise ValueError(f"Falta (o es inválida) la tensión '{RMV_TENSION_CLAVE}' en el JSON.")
+
+    print(f"\nCORRIENTE ALTA: I_max {parametros['I_max']:.1f} A > {umbral:g} A "
+          f"(máx. de los otros CBC)")
+    print(f"Se evalúa RMV II con la matriz de disponibilidad "
+          f"(tensión: {RMV_TENSION_CLAVE} = {tension:g} kV). "
+          f"La conexión ({datos.get('prim_grupo')}) no se considera.")
+
+    opcion, motivo = seleccionar_rmv2(parametros["I_max"], tension)
+
+    if opcion is None:
+        print("\nNo se ha podido seleccionar un CBC.")
+        print(motivo)
+        return
+
+    print("\nCBC SELECCIONADO")
+    print("-" * 60)
+    print(f"Modelo: {MODELO_RMV2}")
+    print(f"Marca: {MARCA_RMV2}")
+    print("Conexión: Y / D (indistinta)")
+    print(f"Corriente nominal: {opcion['corriente']} A")
+    print(f"Clase de tensión: {opcion['tension']:g} kV")
+
+    generar_pma_rmv2(opcion, datos["tension_prim"])
+    print("\nArchivo PMA.xlsx generado correctamente.")
+
+
 # ============================================================
 # EJECUCIÓN
 # ============================================================
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None)
+    main(sys.argv[1] if len(sys.argv) > 1 else None)    
